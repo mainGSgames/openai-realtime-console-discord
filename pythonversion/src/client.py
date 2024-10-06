@@ -16,11 +16,15 @@ class RealtimeClient(RealtimeEventHandler):
             'input_audio_format': 'pcm16',
             'output_audio_format': 'pcm16',
             'input_audio_transcription': None,
-            'turn_detection': None,
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 200
+            },
             'tools': [],
             'tool_choice': 'auto',
-            'temperature': 0.8,
-            'max_response_output_tokens': 4096,
+            'temperature': 0.8
         }
         self.session_config = {}
         self.transcription_models = [{'model': 'whisper-1'}]
@@ -113,8 +117,10 @@ class RealtimeClient(RealtimeEventHandler):
         if self.is_connected():
             raise Exception("Already connected, use .disconnect() first")
         await self.realtime.connect()
-        self.update_session()
+        await self.wait_for_session_created()  # Wait for session.created
+        self.update_session()  # Now it's safe to update the session
         return True
+
 
     async def wait_for_session_created(self):
         if not self.realtime.is_connected():

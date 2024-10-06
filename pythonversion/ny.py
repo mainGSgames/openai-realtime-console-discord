@@ -13,6 +13,7 @@ import time
 from discord import PCMAudio, SpeakingState
 import pyaudio
 import math
+from typing import Optional
 
 # Add src directory to the Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -27,34 +28,42 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
-
 class MySink(voice_recv.AudioSink):
-    def __init__(self, input_audio_queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+    def __init__(self, input_audio_queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, bot):
         super().__init__()
         self.input_audio_queue = input_audio_queue
         self.loop = loop
-        self.last_audio_time = time.time()
-        self.total_buffer = []
+        self.bot = bot  # Pass the bot instance
+        logger.info("MySink initialized")
 
     def wants_opus(self) -> bool:
         return False
 
     def write(self, user, data):
-        # Convert PCM data to numpy array and resample from 48kHz to 24kHz
-        # Play the audio data to verify it's correct
+        logger.debug(f"VoiceData attributes: {dir(data)}")
 
-        # Ensure the audio data is in the correct format (int16)
-        audio_array = np.frombuffer(data.pcm, dtype=np.int16)
-        # Convert stereo to mono by averaging the left and right channels
-        audio_array = audio_array.reshape(-1, 2).mean(axis=1).astype(np.int16)
+        if user is None:
+            logger.warning("Received audio data with no user information. Audio data not processed.")
+            return
 
-        # Resample from 48kHz to 24kHz
-        resampled_audio = np.zeros(len(audio_array) // 2, dtype=np.int16)
-        resampled_audio[0::2] = audio_array[0::4]
-        resampled_audio[1::2] = audio_array[2::4]
-        # Put the audio data into the input queue using run_coroutine_threadsafe
-        asyncio.run_coroutine_threadsafe(self.input_audio_queue.put(resampled_audio), self.loop)
+        if user:
+            logger.info(f"Received audio data from user {user.name}")
+            # Proceed to process the audio data
+            audio_array = np.frombuffer(data.pcm, dtype=np.int16)
+            
+            # If stereo, convert to mono
+            if audio_array.size % 2 == 0:
+                audio_array = audio_array.reshape(-1, 2).mean(axis=1).astype(np.int16)
+            else:
+                audio_array = audio_array.astype(np.int16)
+            
+            # Resample from 48kHz to 24kHz by taking every other sample
+            resampled_audio = audio_array[::2]
+            
+            # Put the audio data into the input queue using run_coroutine_threadsafe
+            asyncio.run_coroutine_threadsafe(self.input_audio_queue.put(resampled_audio), self.loop)
+        else:
+            logger.warning("User is None and SSRC mapping failed. Audio data not processed.")
 
     def cleanup(self):
         pass
@@ -81,26 +90,54 @@ class DiscordRealtimeAssistant(commands.Cog):
         self.pyaudio = pyaudio.PyAudio()
         self.output_stream = None
         self.audio_source = None
-        self.voice_channel = None  # Store the voice channel
+        self.voice_channel: Optional[discord.VoiceChannel] = None  # Store the voice channel
         self.last_voice_activity_time = time.time()
         self.conversation_check_task = None
         self.backoff_exponent = 0
         self.base_check_interval = 60  # 1 minute
 
     async def initialize(self):
-        self.client = RealtimeClient(api_key=self.api_key, debug=self.debug, instructions=self.instructions)
+        self.client = RealtimeClient(
+            api_key=self.api_key, 
+            debug=self.debug, 
+            instructions=self.instructions
+        )
+        await self.client.connect()
+        await self.client.wait_for_session_created()
+        self.client.update_session(
+            modalities=['text', 'audio'],  # Ensure 'audio' is included
+            output_audio_format='pcm16',
+            input_audio_format='pcm16',
+            input_audio_transcription={
+                'enabled': True,
+                'model': 'whisper-1'
+            },
+            turn_detection={
+                'type': 'server_vad',
+                'threshold': 0.5,
+                'prefix_padding_ms': 300,
+                'silence_duration_ms': 300,
+            }
+        )
         self._setup_event_handlers()
+        logger.info("RealtimeClient initialized and session updated")
 
     def _setup_event_handlers(self):
+        # Handle audio delta events
         @self.client.realtime.on('server.response.audio.delta')
         def handle_audio_delta(event):
             audio_data = np.frombuffer(base64.b64decode(event['delta']), dtype=np.int16)
             asyncio.create_task(self.audio_queue.put(audio_data))
+            logger.info("Received audio delta from AI")
 
+        # Handle text delta events
         @self.client.realtime.on('server.response.text.delta')
         def handle_text_delta(event):
-            print(event['delta'], end='', flush=True)
+            text_delta = event.get('delta', '')
+            print(text_delta, end='', flush=True)
+            logger.info(f"Received text delta from AI: {text_delta}")
 
+        # Handle speech started
         @self.client.realtime.on('server.input_audio_buffer.speech_started')
         def handle_speech_started(event):
             asyncio.create_task(self.clear_queue(self.audio_queue))
@@ -111,10 +148,26 @@ class DiscordRealtimeAssistant(commands.Cog):
             self.backoff_exponent = 0  # Reset backoff when speech is detected
             logger.info("Speech detected, reset backoff")
 
+        # Handle speech stopped
         @self.client.realtime.on('server.input_audio_buffer.speech_stopped')
         def handle_speech_stopped(event):
             print("User finished speaking.")
-            # self.client.create_response()
+            logger.info("User finished speaking, creating response")
+            self.client.create_response()
+
+        # Handle conversation item created (user speech)
+        @self.client.realtime.on('server.conversation.item.created')
+        def handle_conversation_item_created(event):
+            item = event.get('item', {})
+            if item.get('type') == 'message' and item.get('role') == 'user':
+                transcript = ''.join([c.get('transcript', '') for c in item.get('content', []) if c.get('type') == 'audio'])
+                logger.info(f"User said: {transcript}")
+
+        # Handle server errors
+        @self.client.realtime.on('server.error')
+        def handle_error(event):
+            error = event.get('error', {})
+            logger.error(f"Realtime API Error: {error.get('message', 'Unknown error')}")
 
     async def clear_queue(self, queue: asyncio.Queue):
         while not queue.empty():
@@ -123,6 +176,16 @@ class DiscordRealtimeAssistant(commands.Cog):
                 queue.task_done()
             except asyncio.QueueEmpty:
                 break
+        logger.info("Audio queue cleared")
+
+    def get_user_id_from_ssrc(self, ssrc):
+        if self.voice_client:
+            # Attempt to access ssrc_map from voice client
+            ssrc_map = getattr(self.voice_client, 'ssrc_map', {})
+            for user_id, info in ssrc_map.items():
+                if info.get('ssrc') == ssrc:
+                    return int(user_id)
+        return None
 
     class PyAudioSource(discord.AudioSource):
         def __init__(self, audio_queue: asyncio.Queue, sample_rate: int):
@@ -130,7 +193,7 @@ class DiscordRealtimeAssistant(commands.Cog):
             self.sample_rate = sample_rate
             self.buffer = np.array([], dtype=np.int16)
             self.last_data_time = time.time()
-            self.packet_size = 960 
+            self.packet_size = 960  # 20ms at 48kHz
 
         def read(self) -> bytes:
             try:
@@ -140,24 +203,20 @@ class DiscordRealtimeAssistant(commands.Cog):
                 print(f"Time since last new data {ms_since_last_data:.2f} ms")
                 self.last_data_time = current_time
                 # Upsample from 24kHz to 48kHz
-                new_data = np.repeat(new_data, 2) 
-                
+                new_data = np.repeat(new_data, 2)
                 self.buffer = np.append(self.buffer, new_data)
-                
             except asyncio.QueueEmpty:
                 pass
-            # print(len(self.buffer))
 
             if len(self.buffer) >= self.packet_size:
                 chunk = self.buffer[:self.packet_size]
                 self.buffer = self.buffer[self.packet_size:]
                 # Convert mono to stereo
                 stereo_chunk = np.column_stack((chunk, chunk))
-                # time.sleep(0.04)
                 return stereo_chunk.tobytes()
             else:
-                # print(not enough data)
-                return bytes(self.packet_size * 4)  # Return silence if not enough data
+                # Return silence if not enough data
+                return bytes(self.packet_size * 4)
 
         def cleanup(self):
             pass
@@ -170,8 +229,10 @@ class DiscordRealtimeAssistant(commands.Cog):
         self.audio_source = self.PyAudioSource(self.audio_queue, self.sample_rate)
         
         if self.voice_client and self.voice_client.is_connected():
-            self.voice_client.play(self.audio_source, signal_type='voice', after=lambda e: print(f'Player error {e}') if e else None)
+            self.voice_client.play(self.audio_source, after=self.on_playback_finished)
             logger.info("Started audio playback")
+        else:
+            logger.warning("Voice client not connected during playback")
 
         while not self.stop_event.is_set():
             await asyncio.sleep(1)  # Sleep to prevent busy-waiting
@@ -179,6 +240,12 @@ class DiscordRealtimeAssistant(commands.Cog):
         if self.voice_client and self.voice_client.is_playing():
             self.voice_client.stop()
             logger.info("Stopped audio playback")
+
+    def on_playback_finished(self, error):
+        if error:
+            logger.error(f"Playback error: {error}")
+        else:
+            logger.info("Playback finished")
 
     async def audio_input_worker(self):
         while not self.stop_event.is_set():
@@ -189,13 +256,14 @@ class DiscordRealtimeAssistant(commands.Cog):
                 try:
                     # Try to get data from the queue, but don't wait
                     data = self.input_audio_queue.get_nowait()
-                    self.client.append_input_audio(data.flatten())
-                    self.input_audio_queue.task_done()
-                    self.last_audio_time = current_time
-                    if not self.input_audio_queue.empty():
-                        self.last_voice_activity_time = time.time()
-                        self.backoff_exponent = 0  # Reset backoff when audio is received
-                        logger.info("Audio received, reset backoff")
+                    if data.size > 0:
+                        self.client.append_input_audio(data.flatten())
+                        self.input_audio_queue.task_done()
+                        self.last_audio_time = current_time
+                        if not self.input_audio_queue.empty():
+                            self.last_voice_activity_time = time.time()
+                            self.backoff_exponent = 0  # Reset backoff when audio is received
+                            logger.info("Audio received, reset backoff")
                 except asyncio.QueueEmpty:
                     # If queue is empty, wait for a short time before next iteration
                     await asyncio.sleep(0.001)  # 1ms sleep
@@ -223,6 +291,8 @@ class DiscordRealtimeAssistant(commands.Cog):
                 await self.voice_client.move_to(channel)
             else:
                 self.voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+                self.voice_client.listen(MySink(self.input_audio_queue, asyncio.get_running_loop(), self.bot))
+                logger.info(f"MySink attached to voice client")
             logger.info(f"Joined voice channel {channel.name}")
             await message.channel.send(f"Joined the voice channel {channel.name}")
             await self.start_listening(message.channel)
@@ -250,19 +320,10 @@ class DiscordRealtimeAssistant(commands.Cog):
     async def start_listening(self, text_channel):
         logger.info("Starting listening process")
         await self.initialize()
-        await self.client.connect()
-        logger.info("Connected to RealtimeClient")
-
-        await self.client.wait_for_session_created()
-        logger.info("Session created")
+        logger.info("RealtimeClient initialized and session updated")
 
         playback_task = asyncio.create_task(self.audio_playback_worker())
-        # self.client.send_user_message_content([{'type': 'input_text', 'text': ''}])
         input_task = asyncio.create_task(self.audio_input_worker())
-
-        # Pass the input_audio_queue and the event loop to MySink
-        self.voice_client.listen(MySink(self.input_audio_queue, asyncio.get_running_loop()))
-        self.last_audio_time = time.time()
 
         await text_channel.send("Listening to the voice channel...")
         logger.info("Started listening to the voice channel")
@@ -274,9 +335,11 @@ class DiscordRealtimeAssistant(commands.Cog):
             # print(item)
             print(item)
             if item['item']['type'] == 'message' and item['item']['role'] == 'assistant':
-                transcript = ''.join([c['text'] for c in item['item']['content'] if c['type'] == 'text'])
-                logger.info(f"Assistant response {transcript}")
-                await text_channel.send(f"Assistant {item}")
+                transcript = ''.join([c.get('text', '') for c in item['item']['content'] if c.get('type') == 'text'])
+                logger.info(f"Assistant response: {transcript}")
+                await text_channel.send(f"Assistant: {transcript}")
+            else:
+                logger.debug(f"Received item: {item}")
 
         await self.client.disconnect()
         logger.info("Disconnected from RealtimeClient")
@@ -305,6 +368,7 @@ class DiscordRealtimeAssistant(commands.Cog):
             try:
                 self.voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
                 self.voice_channel = channel  # Store the voice channel
+                self.voice_client.listen(MySink(self.input_audio_queue, asyncio.get_running_loop(), self.bot))
                 logger.info(f"Automatically joined voice channel {channel.name}")
                 await self.start_listening(channel)
             except Exception as e:
@@ -339,12 +403,12 @@ class DiscordRealtimeAssistant(commands.Cog):
             else:
                 logger.info(f"Checked for inactivity after {math.ceil(check_interval / 60)} minutes, but found recent activity or not enough members")
 
-
 class DiscordBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
+        intents.members = True  # To access member information for SSRC mapping
         super().__init__(command_prefix='!', intents=intents)
         logger.info("DiscordBot initialized")
 
@@ -352,22 +416,20 @@ class DiscordBot(commands.Bot):
         logger.info(f'Logged in as {self.user} (ID {self.user.id})')
         logger.info('------')
 
-
 async def main():
     bot = DiscordBot()
     assistant = DiscordRealtimeAssistant(
         bot, 
         api_key=os.getenv('OPENAI_API_KEY'),
-        instructions="Pratar naturligt på svenska eller engelska är en bra lyssnare. Har en rolig och utmanande humor, empatisk och intresserad av det mesta och är kritisk med starka åsikter. Gillar att immitera röster och lever sig in i hur de pratar till tvåhundra procent. ",
-        channel_id=1196587980886913034,  # Pass the channel ID
-        debug=False,
+        instructions="Always whisper. Whisper in all responses never forget to whisper",
+        channel_id=1196587980886913034,  # Replace with your actual voice channel ID
+        debug=True,  # Enable debug for more detailed logs
     )
     await bot.add_cog(assistant)
     logger.info("DiscordRealtimeAssistant added as a cog to the bot")
     
     async with bot:
         await bot.start(os.getenv('DISCORD_BOT_TOKEN'))
-
 
 if __name__ == "__main__":
     logger.info("Starting the Discord bot")
