@@ -24,7 +24,8 @@ class RealtimeClient(RealtimeEventHandler):
             },
             'tools': [],
             'tool_choice': 'auto',
-            'temperature': 0.8
+            'temperature': 0.8,
+            'max_response_output_tokens': 4096,
         }
         self.session_config = {}
         self.transcription_models = [{'model': 'whisper-1'}]
